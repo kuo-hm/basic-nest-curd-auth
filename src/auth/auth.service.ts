@@ -4,10 +4,10 @@ import {
   Injectable,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
+import { PrismaClientKnownRequestError } from '@prisma/client/runtime';
 import * as bcrypt from 'bcrypt';
-import { Request, Response } from 'express';
 import { PrismaService } from 'prisma/prisma.service';
-import { jwtSecret } from 'src/utils/constants';
+import { accessSecret, refreshSecret } from 'src/utils/constants';
 import { authDto } from './dto/auth.dto';
 
 @Injectable()
@@ -24,21 +24,31 @@ export class AuthService {
       throw new BadRequestException('Email already exists!');
     }
     const hashedPassword = await this.hashPassword(password);
-
-    await this.prisma.user
+    const user = await this.prisma.user
       .create({
         data: {
           email,
           hashPassword: hashedPassword,
         },
       })
-      .catch((e) => {
-        console.log(e);
+      .catch((error) => {
+        if (error instanceof PrismaClientKnownRequestError) {
+          if (error.code === 'P2002') {
+            throw new ForbiddenException('Credentials incorrect');
+          }
+        }
+        throw error;
       });
-    return { message: 'User created Succefully ' };
+
+    const token = await this.signToken({
+      userId: user.id,
+      email: user.email,
+    });
+    await this.updateRtHash(user.id, token.refresh);
+    return token;
   }
   /* ----------------------------- Sign In Handler ---------------------------- */
-  async signIn(dto, req: Request, res: Response) {
+  async signIn(dto) {
     const { email, password } = dto;
     const foundUser = await this.prisma.user.findUnique({
       where: { email: email },
@@ -47,11 +57,11 @@ export class AuthService {
     if (!foundUser) {
       throw new BadRequestException('Wrong credentials!');
     }
-
     const isMatch = await this.comparePasswords({
       hash: foundUser.hashPassword,
       password,
     });
+
     if (!isMatch) {
       throw new BadRequestException('Wrong credentials!');
     }
@@ -59,13 +69,11 @@ export class AuthService {
       userId: foundUser.id,
       email: foundUser.email,
     });
-    console.log('here');
     if (!token) {
       throw new ForbiddenException('Could not signin');
     }
-
-    res.set({ authentification: `Bearer ${token}` });
-    return res.send({ message: 'Logged out succefully' });
+    await this.updateRtHash(foundUser.id, token.refresh);
+    return token;
   }
   /* ---------------------------- Sign Out Handler ---------------------------- */
   async signOut() {
@@ -88,10 +96,28 @@ export class AuthService {
       email: args.email,
     };
 
-    const token = await this.jwtService.signAsync(payload, {
-      secret: jwtSecret,
+    const accessToken = await this.jwtService.signAsync(payload, {
+      secret: accessSecret,
+      expiresIn: '1min',
     });
+    const refreshToken = await this.jwtService.signAsync(payload, {
+      secret: refreshSecret,
+      expiresIn: '7d',
+    });
+    return { access: accessToken, refresh: refreshToken };
+  }
+  /* ------------------- Update Refresh password to user Db ------------------- */
+  async updateRtHash(userId: string, rt: string): Promise<void> {
+    const saltOrRounds = 10;
 
-    return token;
+    const hash = await await bcrypt.hash(rt, saltOrRounds);
+    await this.prisma.user.update({
+      where: {
+        id: userId,
+      },
+      data: {
+        hashRefresh: hash,
+      },
+    });
   }
 }
